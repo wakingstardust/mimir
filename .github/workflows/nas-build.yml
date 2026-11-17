@@ -1,0 +1,111 @@
+name: nas-build
+
+# Builds upstream MakerViking/mimir for CPUs without AVX (TNAS Celeron N5095).
+# Stock releases statically link pyke's onnxruntime, compiled -march=x86-64-v3.
+# This build switches fastembed to ort-load-dynamic and loads Microsoft's
+# onnxruntime from a file at run time (ORT_DYLIB_PATH).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (blank = latest upstream release)"
+        required: false
+  schedule:
+    - cron: "17 14 * * 1"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: MakerViking/mimir
+  ORT_PIN: "=2.0.0-rc.12"
+  MS_ORT_VERSION: "1.24.2"
+  MS_ORT_SHA256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Pick tag
+        id: tag
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag=$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "nas-$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "nas-$tag already released"
+          fi
+
+      - name: Check out upstream
+        if: steps.tag.outputs.skip != 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.tag.outputs.tag }}
+          path: src
+
+      - name: Patch fastembed to load onnxruntime dynamically
+        if: steps.tag.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          s = open("Cargo.toml").read()
+          ort = 'ort = { version = "%s", default-features = false }\n' % os.environ["ORT_PIN"]
+          if ort not in s:
+              sys.exit("ort pin changed upstream: choose a matching Microsoft ORT version, then update ORT_PIN and MS_ORT_*")
+          old = 'fastembed = "5"\n'
+          if s.count(old) != 1:
+              sys.exit("fastembed line changed upstream: update the patch")
+          s = s.replace(old, 'fastembed = { version = "5", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls", "image-models"] }\n')
+          open("Cargo.toml", "w").write(s)
+          PY
+          git diff --stat
+
+      - name: Build
+        if: steps.tag.outputs.skip != 'true'
+        working-directory: src
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version | tee ../rustc-version.txt
+          cargo build --release --locked -p mimir-mem || cargo build --release -p mimir-mem
+
+      - name: Check the binary
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          bin=src/target/release/mimir
+          if strings -n 8 "$bin" | grep -q ort-artifacts; then echo "pyke onnxruntime still linked"; exit 1; fi
+          objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
+          curl -sSfLO "https://github.com/microsoft/onnxruntime/releases/download/v${MS_ORT_VERSION}/onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz"
+          echo "${MS_ORT_SHA256}  onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz" | sha256sum -c
+          tar xzf "onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz"
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user >/dev/null
+          export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-${MS_ORT_VERSION}/lib/libonnxruntime.so.${MS_ORT_VERSION}"
+          export MIMIR_HOME="$RUNNER_TEMP/mimir-home"
+          # Nehalem = SSE4.2, no AVX: an AVX instruction anywhere on these paths dies with SIGILL.
+          q="qemu-x86_64 -cpu Nehalem"
+          $q "$bin" --version
+          $q "$bin" embed --fetch
+          $q "$bin" remember "The TNAS search smoke test stores this sentence about kopia restores" -t note
+          $q "$bin" recall --all --json kopia restore | tee recall.json
+          grep -q kopia recall.json
+
+      - name: Publish
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          tag=${{ steps.tag.outputs.tag }}
+          mkdir out && cp src/target/release/mimir out/mimir
+          tar czf "mimir-$tag-linux-x86_64-noavx.tar.gz" -C out mimir
+          sha256sum "mimir-$tag-linux-x86_64-noavx.tar.gz" > SHA256SUMS
+          cat > notes.md <<NOTES
+          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic).
+          Needs Microsoft onnxruntime ${MS_ORT_VERSION} (sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at libonnxruntime.so.${MS_ORT_VERSION}.
+          Built on ubuntu-22.04 (glibc 2.35) with $(cat rustc-version.txt). Smoke-tested under qemu -cpu Nehalem.
+          NOTES
+          gh release create "nas-$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "mimir $tag for no-AVX x86-64" --notes-file notes.md \
+            "mimir-$tag-linux-x86_64-noavx.tar.gz" SHA256SUMS
