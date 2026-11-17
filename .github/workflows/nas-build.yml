@@ -22,6 +22,8 @@ env:
   ORT_PIN: "=2.0.0-rc.12"
   MS_ORT_VERSION: "1.24.2"
   MS_ORT_SHA256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
+  # Bump when patches/ changes, so the same upstream tag publishes a new release.
+  PATCH_REV: "2"
 
 jobs:
   build:
@@ -35,9 +37,16 @@ jobs:
           tag="${{ inputs.tag }}"
           [ -n "$tag" ] || tag=$(gh api "repos/$UPSTREAM/releases/latest" -q .tag_name)
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if gh release view "nas-$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "nas-$tag already released"
+          echo "release=nas-$tag-r$PATCH_REV" >> "$GITHUB_OUTPUT"
+          if gh release view "nas-$tag-r$PATCH_REV" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "nas-$tag-r$PATCH_REV already released"
           fi
+
+      - name: Check out this repo's patches
+        if: steps.tag.outputs.skip != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: fork
 
       - name: Check out upstream
         if: steps.tag.outputs.skip != 'true'
@@ -63,6 +72,8 @@ jobs:
           s = s.replace(old, 'fastembed = { version = "5", default-features = false, features = ["ort-load-dynamic", "hf-hub-native-tls", "image-models"] }\n')
           open("Cargo.toml", "w").write(s)
           PY
+          # Stops the build if upstream moved the code these patches touch.
+          for p in ../fork/patches/*.patch; do git apply --check "$p" && git apply "$p"; done
           git diff --stat
 
       - name: Build
@@ -86,6 +97,7 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user >/dev/null
           export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-${MS_ORT_VERSION}/lib/libonnxruntime.so.${MS_ORT_VERSION}"
           export MIMIR_HOME="$RUNNER_TEMP/mimir-home"
+          (cd src && cargo test -p mimir-mem remember_recall_get_roundtrip)
           # Nehalem = SSE4.2, no AVX: an AVX instruction anywhere on these paths dies with SIGILL.
           q="qemu-x86_64 -cpu Nehalem"
           $q "$bin" --version
@@ -99,14 +111,15 @@ jobs:
         if: steps.tag.outputs.skip != 'true'
         run: |
           tag=${{ steps.tag.outputs.tag }}
+          rel=${{ steps.tag.outputs.release }}
           mkdir out && cp src/target/release/mimir out/mimir
           tar czf "mimir-$tag-linux-x86_64-noavx.tar.gz" -C out mimir
           sha256sum "mimir-$tag-linux-x86_64-noavx.tar.gz" > SHA256SUMS
           cat > notes.md <<NOTES
-          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic).
+          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths).
           Needs Microsoft onnxruntime ${MS_ORT_VERSION} (sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at libonnxruntime.so.${MS_ORT_VERSION}.
           Built on ubuntu-22.04 (glibc 2.35) with $(cat rustc-version.txt). Smoke-tested under qemu -cpu Nehalem.
           NOTES
-          gh release create "nas-$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          gh release create "$rel" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --title "mimir $tag for no-AVX x86-64" --notes-file notes.md \
             "mimir-$tag-linux-x86_64-noavx.tar.gz" SHA256SUMS
