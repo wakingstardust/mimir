@@ -12,10 +12,26 @@ index 0d63ef1..bdf5b3e 100644
          "id": short_uid(node.kind, &node.uid),
          "uid": node.uid,
 diff --git a/crates/mimir-cli/src/mcp.rs b/crates/mimir-cli/src/mcp.rs
-index 287ae86..3af1e23 100644
+index 287ae86..e77148a 100644
 --- a/crates/mimir-cli/src/mcp.rs
 +++ b/crates/mimir-cli/src/mcp.rs
-@@ -60,6 +60,12 @@ pub struct RecallArgs {
+@@ -41,6 +41,15 @@ fn engine_err(e: impl std::fmt::Display) -> String {
+     format!("error: {e}")
+ }
+ 
++/// MIMIR_HTTP_SNAPSHOT=1 serves a read-only index snapshot. Any commit from
++/// another connection (including the timer's WAL-truncate checkpoint) bumps
++/// `data_version` and drops the vector matrix, so on a slow disk the next
++/// recall rebuilds it from the whole DB. With no impression writes and no
++/// timer, nothing commits and the matrix stays loaded.
++fn snapshot_mode() -> bool {
++    std::env::var("MIMIR_HTTP_SNAPSHOT").is_ok_and(|v| v == "1")
++}
++
+ #[derive(Deserialize, schemars::JsonSchema)]
+ pub struct RecallArgs {
+     /// Search text (natural language or keywords).
+@@ -60,6 +69,12 @@ pub struct RecallArgs {
      /// true = include superseded memories (hidden by default).
      #[serde(default)]
      pub include_superseded: bool,
@@ -28,7 +44,7 @@ index 287ae86..3af1e23 100644
  }
  
  #[derive(Deserialize, schemars::JsonSchema)]
-@@ -181,8 +187,12 @@ fn project_root(m: &Mimir, project_id: Option<i64>) -> Option<std::path::PathBuf
+@@ -181,8 +196,12 @@ fn project_root(m: &Mimir, project_id: Option<i64>) -> Option<std::path::PathBuf
  #[tool_router]
  impl MimirServer {
      pub fn new(engine: Mimir, project_id: Option<i64>) -> Self {
@@ -42,7 +58,7 @@ index 287ae86..3af1e23 100644
              project_id,
              tool_router: Self::tool_router(),
          }
-@@ -208,6 +218,7 @@ impl MimirServer {
+@@ -208,6 +227,7 @@ impl MimirServer {
      )]
      async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
          let project_id = self.project_id;
@@ -50,7 +66,7 @@ index 287ae86..3af1e23 100644
          self.blocking(move |m| {
              let kinds = match args.kind.as_deref().unwrap_or("all") {
                  "all" => vec![],
-@@ -218,7 +229,13 @@ impl MimirServer {
+@@ -218,7 +238,13 @@ impl MimirServer {
                  "code" => vec![Kind::Symbol, Kind::CodeChunk],
                  other => return Err(format!("unknown kind '{other}' (all|memory|doc|code)")),
              };
@@ -65,9 +81,14 @@ index 287ae86..3af1e23 100644
                  Scope::All
              } else {
                  project_id.map(Scope::Project).unwrap_or(Scope::All)
-@@ -247,6 +264,24 @@ impl MimirServer {
+@@ -245,8 +271,28 @@ impl MimirServer {
+                 .enumerate()
+                 .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
                  .collect();
-             store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
+-            store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
++            if !snapshot_mode() {
++                store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
++            }
              let projects = store::project_titles(&m.conn).map_err(engine_err)?;
 +            if json {
 +                let mut collections: std::collections::HashMap<i64, Option<String>> =
@@ -90,12 +111,32 @@ index 287ae86..3af1e23 100644
              let mut out = Vec::new();
              for hit in &hits {
                  let project = hit
-@@ -968,11 +1003,25 @@ async fn serve_http(
+@@ -869,10 +915,12 @@ pub fn run(
+     // marks can starve PASSIVE autocheckpoints and let the -wal grow unbounded.
+     // Same timer also prunes old `recall_event` rows (`[learn]
+     // event_retention_days`, clamped/warned if configured unsafely low).
+-    mimir_core::db::spawn_checkpoint_timer(
+-        engine.paths.db_file.clone(),
+-        engine.config.learn.effective_retention_days(),
+-    );
++    if !snapshot_mode() {
++        mimir_core::db::spawn_checkpoint_timer(
++            engine.paths.db_file.clone(),
++            engine.config.learn.effective_retention_days(),
++        );
++    }
+ 
+     // Optional background sync (own connection, non-fatal, WAL-safe). Logs via
+     // tracing, never stdout — stdout is the MCP protocol channel. Gated on the
+@@ -968,11 +1016,28 @@ async fn serve_http(
              );
          }
      }
 -    let app = mcp_http_router(move || {
 -        Ok(MimirServer::new(
++    if snapshot_mode() {
++        tracing::info!("MIMIR_HTTP_SNAPSHOT=1: recall logs no impressions and the WAL checkpoint timer is off");
++    }
 +    // MIMIR_HTTP_SHARED_ENGINE=1: every /mcp session and /inject share ONE
 +    // engine (requests serialize on its lock). Memory stays at one engine however
 +    // many sessions a client opens or abandons, and a new session costs no model
@@ -119,7 +160,7 @@ index 287ae86..3af1e23 100644
      })
      // `/inject` shares ONE process-wide engine across every request — unlike
      // `/mcp` above, which pays a fresh `Mimir::open()` (ONNX load + full
-@@ -983,17 +1032,20 @@ async fn serve_http(
+@@ -983,17 +1048,20 @@ async fn serve_http(
      // engine (~26ms measured, vs ~480ms for the cold `recall-inject` CLI
      // path on the same store).
      .merge({
@@ -151,7 +192,7 @@ index 287ae86..3af1e23 100644
      });
      let app = with_bearer_auth(app, token);
      let listener = tokio::net::TcpListener::bind(bind).await?;
-@@ -1089,11 +1141,21 @@ where
+@@ -1089,11 +1157,21 @@ where
      use rmcp::transport::streamable_http_server::{
          session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
      };
@@ -178,7 +219,7 @@ index 287ae86..3af1e23 100644
      axum::Router::new().nest_service("/mcp", service)
  }
  
-@@ -1578,10 +1640,43 @@ mod tests {
+@@ -1578,10 +1656,43 @@ mod tests {
                  all_projects: true,
                  rerank: false,
                  include_superseded: false,
