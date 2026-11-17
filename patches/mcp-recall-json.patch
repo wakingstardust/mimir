@@ -12,7 +12,7 @@ index 0d63ef1..bdf5b3e 100644
          "id": short_uid(node.kind, &node.uid),
          "uid": node.uid,
 diff --git a/crates/mimir-cli/src/mcp.rs b/crates/mimir-cli/src/mcp.rs
-index 287ae86..63829e2 100644
+index 287ae86..3af1e23 100644
 --- a/crates/mimir-cli/src/mcp.rs
 +++ b/crates/mimir-cli/src/mcp.rs
 @@ -60,6 +60,12 @@ pub struct RecallArgs {
@@ -28,7 +28,21 @@ index 287ae86..63829e2 100644
  }
  
  #[derive(Deserialize, schemars::JsonSchema)]
-@@ -208,6 +214,7 @@ impl MimirServer {
+@@ -181,8 +187,12 @@ fn project_root(m: &Mimir, project_id: Option<i64>) -> Option<std::path::PathBuf
+ #[tool_router]
+ impl MimirServer {
+     pub fn new(engine: Mimir, project_id: Option<i64>) -> Self {
++        Self::from_shared(Arc::new(Mutex::new(engine)), project_id)
++    }
++
++    fn from_shared(engine: Arc<Mutex<Mimir>>, project_id: Option<i64>) -> Self {
+         MimirServer {
+-            engine: Arc::new(Mutex::new(engine)),
++            engine,
+             project_id,
+             tool_router: Self::tool_router(),
+         }
+@@ -208,6 +218,7 @@ impl MimirServer {
      )]
      async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
          let project_id = self.project_id;
@@ -36,7 +50,7 @@ index 287ae86..63829e2 100644
          self.blocking(move |m| {
              let kinds = match args.kind.as_deref().unwrap_or("all") {
                  "all" => vec![],
-@@ -218,7 +225,13 @@ impl MimirServer {
+@@ -218,7 +229,13 @@ impl MimirServer {
                  "code" => vec![Kind::Symbol, Kind::CodeChunk],
                  other => return Err(format!("unknown kind '{other}' (all|memory|doc|code)")),
              };
@@ -51,7 +65,7 @@ index 287ae86..63829e2 100644
                  Scope::All
              } else {
                  project_id.map(Scope::Project).unwrap_or(Scope::All)
-@@ -247,6 +260,24 @@ impl MimirServer {
+@@ -247,6 +264,24 @@ impl MimirServer {
                  .collect();
              store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
              let projects = store::project_titles(&m.conn).map_err(engine_err)?;
@@ -76,7 +90,68 @@ index 287ae86..63829e2 100644
              let mut out = Vec::new();
              for hit in &hits {
                  let project = hit
-@@ -1089,11 +1120,21 @@ where
+@@ -968,11 +1003,25 @@ async fn serve_http(
+             );
+         }
+     }
+-    let app = mcp_http_router(move || {
+-        Ok(MimirServer::new(
++    // MIMIR_HTTP_SHARED_ENGINE=1: every /mcp session and /inject share ONE
++    // engine (requests serialize on its lock). Memory stays at one engine however
++    // many sessions a client opens or abandons, and a new session costs no model
++    // load or vector-matrix rebuild. For small hosts serving one client.
++    let shared = std::env::var("MIMIR_HTTP_SHARED_ENGINE").is_ok_and(|v| v == "1");
++    let shared_engine = if shared {
++        let mut engine = Mimir::open()?;
++        eager_load_reranker_if_auto(&mut engine);
++        Some(Arc::new(Mutex::new(engine)))
++    } else {
++        None
++    };
++    let session_engine = shared_engine.clone();
++    let app = mcp_http_router(move || match &session_engine {
++        Some(engine) => Ok(MimirServer::from_shared(engine.clone(), project_id)),
++        None => Ok(MimirServer::new(
+             Mimir::open().map_err(std::io::Error::other)?,
+             project_id,
+-        ))
++        )),
+     })
+     // `/inject` shares ONE process-wide engine across every request — unlike
+     // `/mcp` above, which pays a fresh `Mimir::open()` (ONNX load + full
+@@ -983,17 +1032,20 @@ async fn serve_http(
+     // engine (~26ms measured, vs ~480ms for the cold `recall-inject` CLI
+     // path on the same store).
+     .merge({
+-        let mut inject_engine = Mimir::open()?;
+-        // Worth eager-loading here specifically: this is the one engine
+-        // every prompt-submit hook call actually reranks through, and
+-        // there's only one of it for the whole process (unlike the
+-        // per-session `/mcp` engines above), so the memory cost doesn't
+-        // multiply with concurrent sessions.
+-        eager_load_reranker_if_auto(&mut inject_engine);
+-        inject_router(InjectState {
+-            engine: Arc::new(Mutex::new(inject_engine)),
+-            project_id,
+-        })
++        let engine = match shared_engine {
++            Some(engine) => engine,
++            None => {
++                let mut inject_engine = Mimir::open()?;
++                // Worth eager-loading here specifically: this is the one engine
++                // every prompt-submit hook call actually reranks through, and
++                // there's only one of it for the whole process (unlike the
++                // per-session `/mcp` engines above), so the memory cost doesn't
++                // multiply with concurrent sessions.
++                eager_load_reranker_if_auto(&mut inject_engine);
++                Arc::new(Mutex::new(inject_engine))
++            }
++        };
++        inject_router(InjectState { engine, project_id })
+     });
+     let app = with_bearer_auth(app, token);
+     let listener = tokio::net::TcpListener::bind(bind).await?;
+@@ -1089,11 +1141,21 @@ where
      use rmcp::transport::streamable_http_server::{
          session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
      };
@@ -103,7 +178,7 @@ index 287ae86..63829e2 100644
      axum::Router::new().nest_service("/mcp", service)
  }
  
-@@ -1578,10 +1619,43 @@ mod tests {
+@@ -1578,10 +1640,43 @@ mod tests {
                  all_projects: true,
                  rerank: false,
                  include_superseded: false,

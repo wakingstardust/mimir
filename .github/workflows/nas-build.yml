@@ -23,7 +23,7 @@ env:
   MS_ORT_VERSION: "1.24.2"
   MS_ORT_SHA256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
   # Bump when patches/ changes, so the same upstream tag publishes a new release.
-  PATCH_REV: "4"
+  PATCH_REV: "5"
 
 jobs:
   build:
@@ -107,14 +107,23 @@ jobs:
           $q "$bin" recall --all --json kopia restore | tee recall.json
           grep -q kopia recall.json
           # The HTTP server must accept an extra Host name from MIMIR_HTTP_ALLOWED_HOSTS and still refuse others.
-          MIMIR_HTTP_ALLOWED_HOSTS=claude-search:7811 $q "$bin" mcp --http 127.0.0.1:7811 > serve.log 2>&1 &
+          MIMIR_HTTP_SHARED_ENGINE=1 MIMIR_HTTP_ALLOWED_HOSTS=claude-search:7811 $q "$bin" mcp --http 127.0.0.1:7811 > serve.log 2>&1 &
           srv=$!
           for _ in $(seq 1 90); do grep -q "listening on http" serve.log && break; sleep 1; done
           init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}'
           code() { curl -s -o /dev/null -w '%{http_code}' -H "Host: $1" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$init" http://127.0.0.1:7811/mcp; }
           ok=$(code claude-search:7811); bad=$(code elsewhere:7811); echo "allowed host -> $ok, other host -> $bad"
-          kill $srv
           [ "$ok" = 200 ] && [ "$bad" != 200 ]
+          # Two sessions on the shared engine must both answer a recall.
+          for n in 1 2; do
+            sid=$(curl -s -D - -o /dev/null -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$init" http://127.0.0.1:7811/mcp | tr -d '\r' | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2}')
+            [ -n "$sid" ]
+            curl -s -o /dev/null -H "mcp-session-id: $sid" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' http://127.0.0.1:7811/mcp
+            curl -s -H "mcp-session-id: $sid" -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"query":"kopia restore","kind":"memory","all_projects":true,"json":true}}}' \
+              http://127.0.0.1:7811/mcp | tee "session$n.txt" | grep -q kopia
+          done
+          kill $srv
 
       - name: Publish
         if: steps.tag.outputs.skip != 'true'
@@ -125,7 +134,7 @@ jobs:
           tar czf "mimir-$tag-linux-x86_64-noavx.tar.gz" -C out mimir
           sha256sum "mimir-$tag-linux-x86_64-noavx.tar.gz" > SHA256SUMS
           cat > notes.md <<NOTES
-          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths and search one project by name; MIMIR_HTTP_ALLOWED_HOSTS adds accepted Host names).
+          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths and search one project by name; MIMIR_HTTP_ALLOWED_HOSTS adds accepted Host names; MIMIR_HTTP_SHARED_ENGINE=1 shares one engine across sessions).
           Needs Microsoft onnxruntime ${MS_ORT_VERSION} (sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at libonnxruntime.so.${MS_ORT_VERSION}.
           Built on ubuntu-22.04 (glibc 2.35) with $(cat rustc-version.txt). Smoke-tested under qemu -cpu Nehalem.
           NOTES
