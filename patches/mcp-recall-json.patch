@@ -12,7 +12,7 @@ index 0d63ef1..bdf5b3e 100644
          "id": short_uid(node.kind, &node.uid),
          "uid": node.uid,
 diff --git a/crates/mimir-cli/src/mcp.rs b/crates/mimir-cli/src/mcp.rs
-index 287ae86..e77148a 100644
+index 287ae86..1ee65cb 100644
 --- a/crates/mimir-cli/src/mcp.rs
 +++ b/crates/mimir-cli/src/mcp.rs
 @@ -41,6 +41,15 @@ fn engine_err(e: impl std::fmt::Display) -> String {
@@ -135,7 +135,7 @@ index 287ae86..e77148a 100644
 -    let app = mcp_http_router(move || {
 -        Ok(MimirServer::new(
 +    if snapshot_mode() {
-+        tracing::info!("MIMIR_HTTP_SNAPSHOT=1: recall logs no impressions and the WAL checkpoint timer is off");
++        tracing::warn!("MIMIR_HTTP_SNAPSHOT=1: recall logs no impressions and the WAL checkpoint timer is off");
 +    }
 +    // MIMIR_HTTP_SHARED_ENGINE=1: every /mcp session and /inject share ONE
 +    // engine (requests serialize on its lock). Memory stays at one engine however
