@@ -41,7 +41,7 @@ jobs:
 
       - name: Check out upstream
         if: steps.tag.outputs.skip != 'true'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ steps.tag.outputs.tag }}
@@ -89,8 +89,9 @@ jobs:
           # Nehalem = SSE4.2, no AVX: an AVX instruction anywhere on these paths dies with SIGILL.
           q="qemu-x86_64 -cpu Nehalem"
           $q "$bin" --version
-          $q "$bin" embed --fetch
           $q "$bin" remember "The TNAS search smoke test stores this sentence about kopia restores" -t note
+          $q "$bin" embed --fetch | tee embed.txt
+          grep -q "embedded 1 node" embed.txt
           $q "$bin" recall --all --json kopia restore | tee recall.json
           grep -q kopia recall.json
 
