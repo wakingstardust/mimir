@@ -12,7 +12,7 @@ index 0d63ef1..bdf5b3e 100644
          "id": short_uid(node.kind, &node.uid),
          "uid": node.uid,
 diff --git a/crates/mimir-cli/src/mcp.rs b/crates/mimir-cli/src/mcp.rs
-index 287ae86..0ad6e60 100644
+index 287ae86..63829e2 100644
 --- a/crates/mimir-cli/src/mcp.rs
 +++ b/crates/mimir-cli/src/mcp.rs
 @@ -60,6 +60,12 @@ pub struct RecallArgs {
@@ -76,7 +76,34 @@ index 287ae86..0ad6e60 100644
              let mut out = Vec::new();
              for hit in &hits {
                  let project = hit
-@@ -1578,10 +1609,43 @@ mod tests {
+@@ -1089,11 +1120,21 @@ where
+     use rmcp::transport::streamable_http_server::{
+         session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+     };
+-    let service = StreamableHttpService::new(
+-        make_server,
+-        LocalSessionManager::default().into(),
+-        StreamableHttpServerConfig::default(),
+-    );
++    let mut config = StreamableHttpServerConfig::default();
++    // Extra Host names to accept beside the loopback defaults, e.g. a container
++    // name on a private network (`MIMIR_HTTP_ALLOWED_HOSTS=claude-search:7811`).
++    if let Ok(extra) = std::env::var("MIMIR_HTTP_ALLOWED_HOSTS") {
++        let extra: Vec<String> = extra
++            .split(',')
++            .map(|h| h.trim().to_string())
++            .filter(|h| !h.is_empty())
++            .collect();
++        if !extra.is_empty() {
++            let hosts: Vec<String> = config.allowed_hosts.iter().cloned().chain(extra).collect();
++            config = config.with_allowed_hosts(hosts);
++        }
++    }
++    let service = StreamableHttpService::new(make_server, LocalSessionManager::default().into(), config);
+     axum::Router::new().nest_service("/mcp", service)
+ }
+ 
+@@ -1578,10 +1619,43 @@ mod tests {
                  all_projects: true,
                  rerank: false,
                  include_superseded: false,
