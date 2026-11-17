@@ -21,7 +21,10 @@ env:
   UPSTREAM: MakerViking/mimir
   ORT_PIN: "=2.0.0-rc.12"
   MS_ORT_VERSION: "1.24.2"
-  MS_ORT_SHA256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
+  # Microsoft.ML.OnnxRuntime on nuget.org. github.com/microsoft/onnxruntime returned 404
+  # from 2026-11-17; the package's linux-x64 libonnxruntime.so is byte-identical
+  # (sha256 ffc84d48...) to the one in the old GitHub tarball.
+  MS_ORT_SHA256: "782564d3d68e87269ea1812cc94710ad06fe014faf093f01a6f89d0bd58719d3"
   # Bump when patches/ changes, so the same upstream tag publishes a new release.
   PATCH_REV: "6"
 
@@ -91,11 +94,11 @@ jobs:
           bin=src/target/release/mimir
           if strings -n 8 "$bin" | grep -q ort-artifacts; then echo "pyke onnxruntime still linked"; exit 1; fi
           objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1
-          curl -sSfLO "https://github.com/microsoft/onnxruntime/releases/download/v${MS_ORT_VERSION}/onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz"
-          echo "${MS_ORT_SHA256}  onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz" | sha256sum -c
-          tar xzf "onnxruntime-linux-x64-${MS_ORT_VERSION}.tgz"
+          curl -sSfL -o ort.nupkg "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${MS_ORT_VERSION}/microsoft.ml.onnxruntime.${MS_ORT_VERSION}.nupkg"
+          echo "${MS_ORT_SHA256}  ort.nupkg" | sha256sum -c
+          unzip -q -j ort.nupkg runtimes/linux-x64/native/libonnxruntime.so -d ort
           sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user >/dev/null
-          export ORT_DYLIB_PATH="$PWD/onnxruntime-linux-x64-${MS_ORT_VERSION}/lib/libonnxruntime.so.${MS_ORT_VERSION}"
+          export ORT_DYLIB_PATH="$PWD/ort/libonnxruntime.so"
           export MIMIR_HOME="$RUNNER_TEMP/mimir-home"
           (cd src && cargo test -p mimir-mem remember_recall_get_roundtrip)
           # Nehalem = SSE4.2, no AVX: an AVX instruction anywhere on these paths dies with SIGILL.
@@ -137,7 +140,7 @@ jobs:
           sha256sum "mimir-$tag-linux-x86_64-noavx.tar.gz" > SHA256SUMS
           cat > notes.md <<NOTES
           Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths and search one project by name; MIMIR_HTTP_ALLOWED_HOSTS adds accepted Host names; MIMIR_HTTP_SHARED_ENGINE=1 shares one engine across sessions; MIMIR_HTTP_SNAPSHOT=1 serves a read-only snapshot with no impression writes or WAL checkpoint timer, so the vector cache is never dropped).
-          Needs Microsoft onnxruntime ${MS_ORT_VERSION} (sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at libonnxruntime.so.${MS_ORT_VERSION}.
+          Needs Microsoft onnxruntime ${MS_ORT_VERSION} (runtimes/linux-x64/native/libonnxruntime.so from the Microsoft.ML.OnnxRuntime NuGet package, package sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at it.
           Built on ubuntu-22.04 (glibc 2.35) with $(cat rustc-version.txt). Smoke-tested under qemu -cpu Nehalem.
           NOTES
           gh release create "$rel" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
