@@ -23,7 +23,7 @@ env:
   MS_ORT_VERSION: "1.24.2"
   MS_ORT_SHA256: "43725474ba5663642e17684717946693850e2005efbd724ac72da278fead25e6"
   # Bump when patches/ changes, so the same upstream tag publishes a new release.
-  PATCH_REV: "2"
+  PATCH_REV: "3"
 
 jobs:
   build:
@@ -116,7 +116,7 @@ jobs:
           tar czf "mimir-$tag-linux-x86_64-noavx.tar.gz" -C out mimir
           sha256sum "mimir-$tag-linux-x86_64-noavx.tar.gz" > SHA256SUMS
           cat > notes.md <<NOTES
-          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths).
+          Upstream $UPSTREAM $tag, rebuilt for x86-64 CPUs without AVX (fastembed ort-load-dynamic), plus patches/ rev $PATCH_REV (MCP recall can return JSON with paths and search one project by name).
           Needs Microsoft onnxruntime ${MS_ORT_VERSION} (sha256 ${MS_ORT_SHA256}) and ORT_DYLIB_PATH pointing at libonnxruntime.so.${MS_ORT_VERSION}.
           Built on ubuntu-22.04 (glibc 2.35) with $(cat rustc-version.txt). Smoke-tested under qemu -cpu Nehalem.
           NOTES
