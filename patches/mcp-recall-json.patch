@@ -12,7 +12,7 @@ index 0d63ef1..bdf5b3e 100644
          "id": short_uid(node.kind, &node.uid),
          "uid": node.uid,
 diff --git a/crates/mimir-cli/src/mcp.rs b/crates/mimir-cli/src/mcp.rs
-index 287ae86..1ee65cb 100644
+index 287ae86..66389ac 100644
 --- a/crates/mimir-cli/src/mcp.rs
 +++ b/crates/mimir-cli/src/mcp.rs
 @@ -41,6 +41,15 @@ fn engine_err(e: impl std::fmt::Display) -> String {
@@ -111,7 +111,19 @@ index 287ae86..1ee65cb 100644
              let mut out = Vec::new();
              for hit in &hits {
                  let project = hit
-@@ -869,10 +915,12 @@ pub fn run(
+@@ -845,8 +891,9 @@ pub fn run(
+     }
+ 
+     // Weekly consolidation runs off the request path: separate thread,
+-    // separate connection (WAL handles the concurrency).
+-    {
++    // separate connection (WAL handles the concurrency). Off in snapshot mode:
++    // its `meta.last_consolidate` write would leave a WAL on a read-only snapshot.
++    if !snapshot_mode() {
+         let cadence = engine.config.consolidate.auto.clone();
+         let model = engine.config.embedding.model.clone();
+         let db_path = engine.paths.db_file.clone();
+@@ -869,10 +916,12 @@ pub fn run(
      // marks can starve PASSIVE autocheckpoints and let the -wal grow unbounded.
      // Same timer also prunes old `recall_event` rows (`[learn]
      // event_retention_days`, clamped/warned if configured unsafely low).
@@ -128,14 +140,14 @@ index 287ae86..1ee65cb 100644
  
      // Optional background sync (own connection, non-fatal, WAL-safe). Logs via
      // tracing, never stdout — stdout is the MCP protocol channel. Gated on the
-@@ -968,11 +1016,28 @@ async fn serve_http(
+@@ -968,11 +1017,28 @@ async fn serve_http(
              );
          }
      }
 -    let app = mcp_http_router(move || {
 -        Ok(MimirServer::new(
 +    if snapshot_mode() {
-+        tracing::warn!("MIMIR_HTTP_SNAPSHOT=1: recall logs no impressions and the WAL checkpoint timer is off");
++        tracing::warn!("MIMIR_HTTP_SNAPSHOT=1: recall logs no impressions, and the WAL checkpoint timer and auto-consolidation are off");
 +    }
 +    // MIMIR_HTTP_SHARED_ENGINE=1: every /mcp session and /inject share ONE
 +    // engine (requests serialize on its lock). Memory stays at one engine however
@@ -160,7 +172,7 @@ index 287ae86..1ee65cb 100644
      })
      // `/inject` shares ONE process-wide engine across every request — unlike
      // `/mcp` above, which pays a fresh `Mimir::open()` (ONNX load + full
-@@ -983,17 +1048,20 @@ async fn serve_http(
+@@ -983,17 +1049,20 @@ async fn serve_http(
      // engine (~26ms measured, vs ~480ms for the cold `recall-inject` CLI
      // path on the same store).
      .merge({
@@ -192,7 +204,7 @@ index 287ae86..1ee65cb 100644
      });
      let app = with_bearer_auth(app, token);
      let listener = tokio::net::TcpListener::bind(bind).await?;
-@@ -1089,11 +1157,21 @@ where
+@@ -1089,11 +1158,21 @@ where
      use rmcp::transport::streamable_http_server::{
          session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
      };
@@ -219,7 +231,7 @@ index 287ae86..1ee65cb 100644
      axum::Router::new().nest_service("/mcp", service)
  }
  
-@@ -1578,10 +1656,43 @@ mod tests {
+@@ -1578,10 +1657,43 @@ mod tests {
                  all_projects: true,
                  rerank: false,
                  include_superseded: false,
